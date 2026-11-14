@@ -12,9 +12,12 @@ SAMPLES = Path(__file__).resolve().parent.parent / "samples"
 
 
 @pytest.fixture(scope="module")
-def client():
-    with TestClient(app) as c:
-        yield c
+def client(tmp_path_factory):
+    db_path = tmp_path_factory.mktemp("db") / "cracks.db"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CRACK_DB_PATH", str(db_path))
+        with TestClient(app) as c:
+            yield c
 
 
 def test_health_and_docs(client):

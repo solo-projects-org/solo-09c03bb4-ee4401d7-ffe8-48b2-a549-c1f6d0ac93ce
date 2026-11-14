@@ -1,9 +1,15 @@
-# 裂纹事件流契约排程 API
+# 裂纹事件流契约排程与日报发布 API
 
-轨道检测裂纹事件流滚动升级的**契约兼容性排程服务**。提交采集端（发布端）与质检、
-日报（两个独立部署的订阅端）新旧两版的扁平 JSON 字段定义，自动计算三方从全旧版
-经混跑到全新版的安全升级顺序；不存在安全顺序时，指出受阻的版本组合、字段级违规
-以及发布端可发出即被拒收的示例消息。
+两类能力，同进程、同 SQLite：
+
+1. **契约排程**：轨道检测裂纹事件流滚动升级的契约兼容性排程服务。提交采集端
+   （发布端）与质检、日报（两个独立部署的订阅端）新旧两版的扁平 JSON 字段定义，
+   自动计算三方从全旧版经混跑到全新版的安全升级顺序；不存在安全顺序时，指出受阻的
+   版本组合、字段级违规以及发布端可发出即被拒收的示例消息。
+2. **批次补传与日报发布**：采集端可整批补传裂纹事件（全局事件号跨批去重、同号
+   异内容整批拒绝），并按巡测日发布可复核的裂纹日报（按车号、缺陷等级计数并列出
+   纳入的事件号）。发布请求号幂等、版本不可变、失败不留半成品，并与并发补传安全
+   交错。
 
 ## 1. 背景与语义约定
 
@@ -48,18 +54,26 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 入口、Swagger 示例挂载
-│   ├── models.py      # Pydantic 模型与入参校验
-│   ├── compat.py      # 版本对兼容性判定与反例消息构造
-│   └── planner.py     # 27 状态空间 BFS 排程
+│   ├── main.py          # FastAPI 入口、生命周期（打开 SQLite）、Swagger 示例挂载
+│   ├── models.py        # 契约排程的 Pydantic 模型与入参校验
+│   ├── compat.py        # 版本对兼容性判定与反例消息构造
+│   ├── planner.py       # 27 状态空间 BFS 排程
+│   ├── report_models.py # 批次/日报的 Pydantic 模型（字段别名、规范化）
+│   ├── db.py            # SQLite 存储：整批原子入库、事件幂等、日报快照
+│   └── report_api.py    # 批次接收/复核、日报发布/查询接口
 ├── samples/
-│   ├── safe_subscriber_first.json   # 样例一：有安全顺序（先订阅端后发布端）
-│   └── infeasible_circular.json     # 样例二：循环依赖，无解
-├── tests/             # pytest：兼容规则 / 求解器 / HTTP 层（23 个用例）
+│   ├── safe_subscriber_first.json    # 排程样例一：有安全顺序（先订阅端后发布端）
+│   ├── infeasible_circular.json      # 排程样例二：循环依赖，无解
+│   ├── backfill_batch.json           # 首次补传 3 条事件
+│   ├── backfill_later.json           # 后到的一批事件
+│   ├── reingest_conflict.json        # 同号异内容，整批 409
+│   ├── publish_retry.json            # 首次发布 / 同请求号重试
+│   └── republish_after_backfill.json # 补传后换新请求号重发
+├── tests/               # pytest：兼容规则 / 求解器 / HTTP / 批次与发布语义（46 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-└── run_samples.sh     # 一键用两个样例打 API
+└── run_samples.sh       # 一键用样例打排程与日报 API
 ```
 
 ## 4. 启动方式
@@ -74,6 +88,8 @@ docker compose up --build
 ```
 
 镜像内带 `HEALTHCHECK`，compose 同步配置了健康检查；以非 root 用户运行。
+SQLite 落在 `/app/data/cracks.db`（compose 用命名卷 `crack-data` 持久化），
+可用环境变量 `CRACK_DB_PATH` 覆盖。
 
 ### 本地直接运行
 
@@ -83,11 +99,14 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 一键演示两个样例
+### 一键演示
 
 ```bash
-./run_samples.sh          # BASE_URL 可改指向其他环境
+./run_samples.sh          # BASE_URL 可改指向其他环境，DAY 可改巡测日
 ```
+
+脚本先跑两个排程样例，再演示：补传首批 → 重投同批（只计一次）→ 发布日报 →
+同请求号重试返回原版 → 补传后到批次 → 新请求号重发版本 2 → 同号异内容整批 409。
 
 ## 5. API 概览
 
@@ -95,8 +114,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/api/v1/plan` | 提交三方契约，返回安全升级顺序或无解报告 |
 | POST | `/api/v1/compatibility` | 返回全部 8 个版本组合的兼容性明细（含违规与反例） |
+| POST | `/api/v1/events/batches` | 整批补传裂纹事件（原子入库，跨批按事件号幂等） |
+| GET | `/api/v1/events/batches/{batch_id}` | 按批次号复核入库明细 |
+| POST | `/api/v1/reports/publish` | 按巡测日发布一版日报（请求号幂等） |
+| GET | `/api/v1/reports/{survey_day}` | 列出该巡测日全部日报版本（旧版可查） |
+| GET | `/api/v1/reports/{survey_day}/{version}` | 查询指定版本日报快照 |
 | GET | `/health` | 健康检查 |
-| GET | `/docs` | Swagger UI，请求体已内置两个样例可一键填充 |
+| GET | `/docs` | Swagger UI，请求体已内置样例可一键填充 |
 
 请求体结构（节选）：
 
@@ -122,7 +146,60 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `parties` 必须恰好包含 1 个 `producer` 和 2 个 `subscriber`，三方 `id` 互不相同；
 同一份 schema 内字段名不得重复；非法入参返回 422 并带字段级错误说明。
 
-## 6. 两个内置样例解读
+## 6. 批次补传与日报发布语义
+
+### 6.1 事件与批次
+
+```json
+POST /api/v1/events/batches
+{
+  "events": [
+    {"event_id": "EV-001", "survey_day": "2026-11-01",
+     "car_id": "CAR-001", "defect_level": "L2"}
+  ]
+}
+```
+
+- 事件字段：`event_id`（全局事件号）、`survey_day`（巡测日）、`car_id`（车号）、
+  `defect_level`（缺陷等级）。事件号与车号接受字符串或整数，入库前规范化为字符串
+  （`1001` 与 `"1001"` 视为同一事件、同一车号）；兼容别名 `event_no` /
+  `inspection_day` / `car_number` / `level`。
+- **一个请求 = 一个批次 = 一个 SQLite 事务**。批内任一条同号异内容，或与已入库
+  事件同号异内容，整批返回 `409`，批记录、事件、批明细全部回滚，不留部分记录。
+- 跨批同号**同内容**只计一次：首次入库记为 `inserted`，后续批次记为 `duplicate`，
+  响应分别列出 `inserted_event_ids` / `duplicate_event_ids`。
+- 重投完全相同的批次（例如采集端超时重发）会生成新的 `batch_id`，但事件总数不变；
+  `GET /api/v1/events/batches/{batch_id}` 可复核该批逐条结论
+  （`inserted` / `duplicate`）。
+
+### 6.2 日报发布与版本
+
+```json
+POST /api/v1/reports/publish
+{"publish_request_id": "pub-20261101-001", "survey_day": "2026-11-01"}
+```
+
+- 日报按**车号 × 缺陷等级**计数（`counts`），并列出纳入的 `event_ids`；
+  同时给出 `batch_ids`，可据此复核“只取到完整提交的批次”。
+- 发布在 `BEGIN IMMEDIATE` 写事务中读取并写入：与并发补传串行化，快照只能看到
+  完整提交的批次；任何异常整体回滚，不会留下可查询的半成品，也不占用版本号。
+- `publish_request_id` 是幂等键：同号重试**返回原版快照**，响应头
+  `X-Idempotent-Replay: true`，即使期间补齐了新批次也不改原版；请求号不能跨巡测日
+  复用（`409`）。
+- **新请求号**发布新版本（同一巡测日内 `version` 从 1 递增），纳入发布时刻已提交的
+  全部事件；**旧版本始终可查且内容不变**：
+  `GET /api/v1/reports/{survey_day}` 列出全部版本，
+  `GET /api/v1/reports/{survey_day}/{version}` 查询指定版本。
+
+### 6.3 并发与持久化
+
+- 存储为单文件 SQLite（WAL + `synchronous=FULL` + `BEGIN IMMEDIATE`）。进程内
+  用一把 `RLock` 串行化写操作；跨进程/多 worker 由 SQLite 写锁与 `busy_timeout`
+  保证互斥。
+- 建表使用 `CREATE TABLE IF NOT EXISTS`，重启后历史批次与日报版本继续可查；
+  compose 以 `crack-data` 卷持久化 `/app/data/cracks.db`。
+
+## 7. 两个内置样例解读
 
 ### 样例一 `safe_subscriber_first.json` —— 先升级订阅端才能新增等级
 
@@ -148,7 +225,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 动作。要打破死锁，需先在契约层面解耦（例如把 `inspector_id` 改为可选、或让
 旧质检先放宽枚举域再分两轮升级）。
 
-## 7. 测试
+## 8. 测试
 
 ```bash
 pip install pytest httpx
@@ -157,4 +234,8 @@ python -m pytest -q
 
 覆盖：未知字段忽略、可选字段缺失、必填缺失、整数/字符串类型冲突、枚举越界、
 无界 string 对 enum、反例消息完整性、可解顺序的订阅端优先约束、无解死锁报告、
-起点不安全、入参校验以及两个样例的 HTTP 端到端行为。
+起点不安全、入参校验，两个排程样例的 HTTP 端到端行为；以及批次整批原子入库、
+跨批同号同内容去重、同号异内容（批内/跨批）整批 409 且无残留、重投幂等、
+标识规范化、日报按车号×等级计数与事件号清单、请求号幂等返回原版、新请求号纳入
+后到批次、旧版不可变、发布故障回滚不留半成品，以及补传/发布真并发下快照只含
+完整批次、同一请求号并发重试只生成一版、重启后历史批次与版本仍可查。

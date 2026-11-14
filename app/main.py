@@ -7,16 +7,33 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
 from .compat import all_pairs
+from .db import ReportStore
 from .models import PlanRequest, PlanResponse, PairCompatibility
 from .planner import solve
+from .report_api import router as report_router
 
 _SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
+_DEFAULT_DB_PATH = str(Path(__file__).resolve().parent.parent / "data" / "cracks.db")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时打开 SQLite（目录自动创建），关闭时释放连接。"""
+    db_path = os.environ.get("CRACK_DB_PATH", _DEFAULT_DB_PATH)
+    store = ReportStore(db_path)
+    app.state.store = store
+    try:
+        yield
+    finally:
+        store.close()
 
 
 def _load_sample(name: str) -> dict:
@@ -35,9 +52,14 @@ app = FastAPI(
         "计算滚动升级期间每一步都安全的升级顺序；无解时给出受阻的版本组合、"
         "字段级违规及发布端可发出即被拒收的示例消息。\n\n"
         "兼容规则：字段限 integer/string/enum；订阅端忽略未知字段；"
-        "发布端可选字段可能缺失；枚举可能取声明的任一值。"
+        "发布端可选字段可能缺失；枚举可能取声明的任一值。\n\n"
+        "另提供裂纹事件整批补传与按巡测日发布可复核日报的接口："
+        "事件按全局事件号跨批去重、同号异内容整批拒绝；日报按车号与缺陷等级计数，"
+        "发布请求号幂等、旧版不可变、失败不留半成品。"
     ),
+    lifespan=lifespan,
 )
+app.include_router(report_router)
 
 
 @app.get("/", include_in_schema=False)

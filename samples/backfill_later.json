@@ -1,0 +1,10 @@
+{
+  "events": [
+    {
+      "event_id": "EV-20261101-0004",
+      "survey_day": "2026-11-01",
+      "car_id": "CAR-002",
+      "defect_level": "L3"
+    }
+  ]
+}

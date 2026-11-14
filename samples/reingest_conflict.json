@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "event_id": "EV-20261101-0001",
+      "survey_day": "2026-11-01",
+      "car_id": "CAR-999",
+      "defect_level": "L1"
+    },
+    {
+      "event_id": "EV-20261101-0005",
+      "survey_day": "2026-11-01",
+      "car_id": "CAR-003",
+      "defect_level": "L2"
+    }
+  ]
+}
